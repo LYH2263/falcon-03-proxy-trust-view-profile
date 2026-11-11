@@ -34,7 +34,10 @@ ASGI App
     :members:
 
 Options
--------
+--------
+
+.. autoclass:: falcon.TrustProfile
+    :members:
 
 .. autoclass:: falcon.RequestOptions
     :members:

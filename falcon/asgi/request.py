@@ -37,6 +37,7 @@ from falcon.asgi_spec import AsgiEvent
 from falcon.asgi_spec import AsgiRequestScope
 from falcon.constants import SINGLETON_HEADERS
 from falcon.forwarded import Forwarded
+from falcon.trust import TrustProfile
 from falcon.util import deprecation
 from falcon.util import ETag
 from falcon.util.uri import parse_host
@@ -99,6 +100,7 @@ class Request(request.Request):
     _media: UnsetOr[Any] = _UNSET
     _media_error: Exception | None = None
     _stream: BoundedStream | None = None
+    _trust_profile: TrustProfile | None = None
 
     scope: AsgiRequestScope
     """Reference to the ASGI HTTP connection scope passed in
@@ -160,6 +162,14 @@ class Request(request.Request):
         self.is_websocket = scope['type'] == 'websocket'
 
         self.options = options if options is not None else request.RequestOptions()
+
+        # NOTE: Snapshot the host's trust profile (when enabled) so that
+        #   advancing it on RequestOptions cannot rewrite this Request's
+        #   label or its four independent proxy trust chains. The class
+        #   variable default of None is reused in the common case to avoid
+        #   an extra assignment per Request.
+        if self.options.trust_profile is not None:
+            self._trust_profile = self.options.trust_profile
 
         self.method = 'GET' if self.is_websocket else scope['method']
 
@@ -388,31 +398,61 @@ class Request(request.Request):
 
     @property
     def forwarded_scheme(self) -> str:
-        # PERF(kgriffs): Since the Forwarded header is still relatively
-        # new, we expect X-Forwarded-Proto to be more common, so
-        # try to avoid calling self.forwarded if we can, since it uses a
-        # try...catch that will usually result in a relatively expensive
-        # raised exception.
-        if b'forwarded' in self._asgi_headers:
-            forwarded = self.forwarded
-            if forwarded:
-                # Use first hop, fall back on own scheme
-                scheme = forwarded[0].scheme or self.scheme
+        profile = self._trust_profile
+        if profile is None:
+            # PERF(kgriffs): Since the Forwarded header is still relatively
+            # new, we expect X-Forwarded-Proto to be more common, so
+            # try to avoid calling self.forwarded if we can, since it uses a
+            # try...catch that will usually result in a relatively expensive
+            # raised exception.
+            if b'forwarded' in self._asgi_headers:
+                forwarded = self.forwarded
+                if forwarded:
+                    # Use first hop, fall back on own scheme
+                    scheme = forwarded[0].scheme or self.scheme
+                else:
+                    scheme = self.scheme
             else:
-                scheme = self.scheme
-        else:
-            # PERF(kgriffs): This call should normally succeed, so
-            # just go for it without wasting time checking it
-            # first. Note also that the indexing operator is
-            # slightly faster than using get().
-            try:
-                scheme = (
-                    self._asgi_headers[b'x-forwarded-proto'].decode('latin1').lower()
-                )
-            except KeyError:
-                scheme = self.scheme
+                # PERF(kgriffs): This call should normally succeed, so
+                # just go for it without wasting time checking it
+                # first. Note also that the indexing operator is
+                # slightly faster than using get().
+                try:
+                    scheme = (
+                        self._asgi_headers[b'x-forwarded-proto']
+                        .decode('latin1')
+                        .lower()
+                    )
+                except KeyError:
+                    scheme = self.scheme
 
-        return scheme
+            return scheme
+
+        return self._frame_forwarded_scheme(profile)
+
+    def _frame_forwarded_scheme(self, profile: TrustProfile) -> str:
+        """Frame the original scheme according to a trust profile snapshot."""
+        for header in profile.scheme_headers:
+            if header == 'forwarded':
+                if (
+                    not profile.trust_forwarded
+                    or b'forwarded' not in self._asgi_headers
+                ):
+                    continue
+
+                forwarded = self.forwarded
+                if forwarded:
+                    # Use first hop, fall back on own scheme
+                    return forwarded[0].scheme or self.scheme
+                return self.scheme
+
+            # 'x-forwarded-proto'
+            try:
+                return self._asgi_headers[b'x-forwarded-proto'].decode('latin1').lower()
+            except KeyError:
+                continue
+
+        return self.scheme
 
     @property
     def host(self) -> str:
@@ -434,29 +474,57 @@ class Request(request.Request):
 
     @property
     def forwarded_host(self) -> str:
-        # PERF(kgriffs): Since the Forwarded header is still relatively
-        # new, we expect X-Forwarded-Host to be more common, so
-        # try to avoid calling self.forwarded if we can, since it uses a
-        # try...catch that will usually result in a relatively expensive
-        # raised exception.
-        if b'forwarded' in self._asgi_headers:
-            forwarded = self.forwarded
-            if forwarded:
-                # Use first hop, fall back on self
-                host = forwarded[0].host or self.netloc
+        profile = self._trust_profile
+        if profile is None:
+            # PERF(kgriffs): Since the Forwarded header is still relatively
+            # new, we expect X-Forwarded-Host to be more common, so
+            # try to avoid calling self.forwarded if we can, since it uses a
+            # try...catch that will usually result in a relatively expensive
+            # raised exception.
+            if b'forwarded' in self._asgi_headers:
+                forwarded = self.forwarded
+                if forwarded:
+                    # Use first hop, fall back on self
+                    host = forwarded[0].host or self.netloc
+                else:
+                    host = self.netloc
             else:
-                host = self.netloc
-        else:
-            # PERF(kgriffs): This call should normally succeed, assuming
-            # that the caller is expecting a forwarded header, so
-            # just go for it without wasting time checking it
-            # first.
-            try:
-                host = self._asgi_headers[b'x-forwarded-host'].decode('latin1')
-            except KeyError:
-                host = self.netloc
+                # PERF(kgriffs): This call should normally succeed, assuming
+                # that the caller is expecting a forwarded header, so
+                # just go for it without wasting time checking it
+                # first.
+                try:
+                    host = self._asgi_headers[b'x-forwarded-host'].decode('latin1')
+                except KeyError:
+                    host = self.netloc
 
-        return host
+            return host
+
+        return self._frame_forwarded_host(profile)
+
+    def _frame_forwarded_host(self, profile: TrustProfile) -> str:
+        """Frame the original host according to a trust profile snapshot."""
+        for header in profile.host_headers:
+            if header == 'forwarded':
+                if (
+                    not profile.trust_forwarded
+                    or b'forwarded' not in self._asgi_headers
+                ):
+                    continue
+
+                forwarded = self.forwarded
+                if forwarded:
+                    # Use first hop, fall back on self
+                    return forwarded[0].host or self.netloc
+                return self.netloc
+
+            # 'x-forwarded-host'
+            try:
+                return self._asgi_headers[b'x-forwarded-host'].decode('latin1')
+            except KeyError:
+                continue
+
+        return self.netloc
 
     @property
     def access_route(self) -> list[str]:
@@ -513,26 +581,81 @@ class Request(request.Request):
                 client = '127.0.0.1'
 
             headers = self._asgi_headers
+            profile = self._trust_profile
 
-            if b'forwarded' in headers:
-                self._cached_access_route = []
+            if profile is None:
+                if b'forwarded' in headers:
+                    self._cached_access_route = []
+                    for hop in self.forwarded or ():
+                        if hop.src is not None:
+                            host, __ = parse_host(hop.src)
+                            self._cached_access_route.append(host)
+                elif b'x-forwarded-for' in headers:
+                    addresses = headers[b'x-forwarded-for'].decode('latin1').split(',')
+                    self._cached_access_route = [ip.strip() for ip in addresses]
+                elif b'x-real-ip' in headers:
+                    self._cached_access_route = [headers[b'x-real-ip'].decode('latin1')]
+
+                if self._cached_access_route:
+                    if self._cached_access_route[-1] != client:
+                        self._cached_access_route.append(client)
+                else:
+                    self._cached_access_route = [client] if client else []
+            else:
+                # NOTE: Profile-driven framing. The four chains are kept
+                #   independent; here only the access-route header priority
+                #   declared by the TrustProfile is consulted.
+                self._cached_access_route = self._frame_access_route_asgi(
+                    profile, client
+                )
+
+        return self._cached_access_route
+
+    def _frame_access_route_asgi(self, profile: TrustProfile, client: str) -> list[str]:
+        """Build the access route according to a trust profile snapshot.
+
+        The first header listed by the profile that is present wins; a
+        malformed value is returned as parsed instead of falling through
+        to the next header. The ASGI ``client`` value is passed in after
+        being read once, because it may be a forward-only iterator.
+        """
+        route: list[str] = []
+        headers = self._asgi_headers
+
+        for header in profile.access_route_headers:
+            if header == 'forwarded':
+                if not profile.trust_forwarded or b'forwarded' not in headers:
+                    continue
+
                 for hop in self.forwarded or ():
                     if hop.src is not None:
                         host, __ = parse_host(hop.src)
-                        self._cached_access_route.append(host)
-            elif b'x-forwarded-for' in headers:
+                        route.append(host)
+                break
+
+            if header == 'x-forwarded-for':
+                if b'x-forwarded-for' not in headers:
+                    continue
+
                 addresses = headers[b'x-forwarded-for'].decode('latin1').split(',')
-                self._cached_access_route = [ip.strip() for ip in addresses]
-            elif b'x-real-ip' in headers:
-                self._cached_access_route = [headers[b'x-real-ip'].decode('latin1')]
+                route = [ip.strip() for ip in addresses]
+                break
 
-            if self._cached_access_route:
-                if self._cached_access_route[-1] != client:
-                    self._cached_access_route.append(client)
+            # 'x-real-ip'
+            if b'x-real-ip' not in headers:
+                continue
+
+            route = [headers[b'x-real-ip'].decode('latin1')]
+            break
+
+        if profile.append_peer_address:
+            if route:
+                if route[-1] != client:
+                    route.append(client)
             else:
-                self._cached_access_route = [client] if client else []
+                route = [client] if client else []
 
-        return self._cached_access_route
+        return route
 
     @property
     def remote_addr(self) -> str:

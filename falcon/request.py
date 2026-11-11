@@ -46,6 +46,7 @@ from falcon.forwarded import Forwarded
 from falcon.media import Handlers
 from falcon.media.json import _DEFAULT_JSON_HANDLER
 from falcon.stream import BoundedStream
+from falcon.trust import TrustProfile
 from falcon.typing import ReadableIO
 from falcon.util import deprecation
 from falcon.util import ETag
@@ -102,6 +103,7 @@ class Request:
         '_cached_relative_uri',
         '_cached_uri',
         '_params',
+        '_trust_profile',
         '_wsgierrors',
         'content_type',
         'context',
@@ -314,6 +316,11 @@ class Request:
         self._cached_relative_uri: str | None = None
         self._cached_uri: str | None = None
 
+        # NOTE: Snapshot the host's trust profile so that advancing the
+        #   profile on RequestOptions can neither rewrite this Request's
+        #   label nor recompute its four proxy trust chains.
+        self._trust_profile: TrustProfile | None = self.options.trust_profile
+
         try:
             self.content_type = self.env['CONTENT_TYPE']
         except KeyError:
@@ -361,11 +368,32 @@ class Request:
     """Value of the User-Agent header, or ``None`` if the header is missing."""
 
     @property
+    def trust_profile(self) -> TrustProfile | None:
+        """Trust framing profile snapshot this Request was constructed with.
+
+        The value is taken from :attr:`~.RequestOptions.trust_profile` when
+        the Request is created, and is never updated afterwards. It serves
+        as the label of the framing rules applied to the four independent
+        proxy trust chains (:attr:`access_route`, :attr:`forwarded`,
+        :attr:`forwarded_scheme`/:attr:`forwarded_host`, and
+        :attr:`forwarded_uri`/:attr:`forwarded_prefix`).
+
+        Returns ``None`` when no trust profile was enabled on the host, in
+        which case the Request follows the built-in default framing rules.
+        """
+        return self._trust_profile
+
+    @property
     def forwarded(self) -> list[Forwarded] | None:
         """Value of the Forwarded header, as a parsed list
         of :class:`falcon.Forwarded` objects, or ``None`` if the header
         is missing. If the header value is malformed, Falcon will
         make a best effort to parse what it can.
+
+        When a :class:`~falcon.TrustProfile` is in effect whose
+        :attr:`~falcon.TrustProfile.trust_forwarded` flag is ``False``, this
+        property resolves to ``None`` as if the header were not present,
+        regardless of what the client sent.
 
         (See also: RFC 7239, Section 4)
         """  # noqa: D205
@@ -376,6 +404,12 @@ class Request:
         # At some point we might look into this but I don't think
         # it's worth it right now.
         if self._cached_forwarded is None:
+            if (
+                self._trust_profile is not None
+                and not self._trust_profile.trust_forwarded
+            ):
+                return None
+
             forwarded = self.get_header('Forwarded')
             if forwarded is None:
                 return None
@@ -696,29 +730,55 @@ class Request:
 
         (See also: RFC 7239, Section 1)
         """
-        # PERF(kgriffs): Since the Forwarded header is still relatively
-        # new, we expect X-Forwarded-Proto to be more common, so
-        # try to avoid calling self.forwarded if we can, since it uses a
-        # try...catch that will usually result in a relatively expensive
-        # raised exception.
-        if 'HTTP_FORWARDED' in self.env:
-            forwarded = self.forwarded
-            if forwarded:
-                # Use first hop, fall back on own scheme
-                scheme = forwarded[0].scheme or self.scheme
+        profile = self._trust_profile
+        if profile is None:
+            # PERF(kgriffs): Since the Forwarded header is still relatively
+            # new, we expect X-Forwarded-Proto to be more common, so
+            # try to avoid calling self.forwarded if we can, since it uses a
+            # try...catch that will usually result in a relatively expensive
+            # raised exception.
+            if 'HTTP_FORWARDED' in self.env:
+                forwarded = self.forwarded
+                if forwarded:
+                    # Use first hop, fall back on own scheme
+                    scheme = forwarded[0].scheme or self.scheme
+                else:
+                    scheme = self.scheme
             else:
-                scheme = self.scheme
-        else:
-            # PERF(kgriffs): This call should normally succeed, so
-            # just go for it without wasting time checking it
-            # first. Note also that the indexing operator is
-            # slightly faster than using get().
-            try:
-                scheme = self.env['HTTP_X_FORWARDED_PROTO'].lower()
-            except KeyError:
-                scheme = self.env['wsgi.url_scheme']
+                # PERF(kgriffs): This call should normally succeed, so
+                # just go for it without wasting time checking it
+                # first. Note also that the indexing operator is
+                # slightly faster than using get().
+                try:
+                    scheme = self.env['HTTP_X_FORWARDED_PROTO'].lower()
+                except KeyError:
+                    scheme = self.env['wsgi.url_scheme']
 
-        return scheme
+            return scheme
+
+        return self._frame_forwarded_scheme(profile)
+
+    def _frame_forwarded_scheme(self, profile: TrustProfile) -> str:
+        """Frame the original scheme according to a trust profile snapshot."""
+        for header in profile.scheme_headers:
+            if header == 'forwarded':
+                if not profile.trust_forwarded or 'HTTP_FORWARDED' not in self.env:
+                    continue
+
+                forwarded = self.forwarded
+                if forwarded:
+                    # Use first hop, fall back on own scheme
+                    return forwarded[0].scheme or self.scheme
+                return self.scheme
+
+            # 'x-forwarded-proto'
+            try:
+                scheme: str = self.env['HTTP_X_FORWARDED_PROTO'].lower()
+                return scheme
+            except KeyError:
+                continue
+
+        return self.scheme
 
     @property
     def uri(self) -> str:
@@ -834,29 +894,55 @@ class Request:
 
         (See also: RFC 7239, Section 4)
         """  # noqa: D205
-        # PERF(kgriffs): Since the Forwarded header is still relatively
-        # new, we expect X-Forwarded-Host to be more common, so
-        # try to avoid calling self.forwarded if we can, since it uses a
-        # try...catch that will usually result in a relatively expensive
-        # raised exception.
-        if 'HTTP_FORWARDED' in self.env:
-            forwarded = self.forwarded
-            if forwarded:
-                # Use first hop, fall back on self
-                host = forwarded[0].host or self.netloc
+        profile = self._trust_profile
+        if profile is None:
+            # PERF(kgriffs): Since the Forwarded header is still relatively
+            # new, we expect X-Forwarded-Host to be more common, so
+            # try to avoid calling self.forwarded if we can, since it uses a
+            # try...catch that will usually result in a relatively expensive
+            # raised exception.
+            if 'HTTP_FORWARDED' in self.env:
+                forwarded = self.forwarded
+                if forwarded:
+                    # Use first hop, fall back on self
+                    host = forwarded[0].host or self.netloc
+                else:
+                    host = self.netloc
             else:
-                host = self.netloc
-        else:
-            # PERF(kgriffs): This call should normally succeed, assuming
-            # that the caller is expecting a forwarded header, so
-            # just go for it without wasting time checking it
-            # first.
-            try:
-                host = self.env['HTTP_X_FORWARDED_HOST']
-            except KeyError:
-                host = self.netloc
+                # PERF(kgriffs): This call should normally succeed, assuming
+                # that the caller is expecting a forwarded header, so
+                # just go for it without wasting time checking it
+                # first.
+                try:
+                    host = self.env['HTTP_X_FORWARDED_HOST']
+                except KeyError:
+                    host = self.netloc
 
-        return host
+            return host
+
+        return self._frame_forwarded_host(profile)
+
+    def _frame_forwarded_host(self, profile: TrustProfile) -> str:
+        """Frame the original host according to a trust profile snapshot."""
+        for header in profile.host_headers:
+            if header == 'forwarded':
+                if not profile.trust_forwarded or 'HTTP_FORWARDED' not in self.env:
+                    continue
+
+                forwarded = self.forwarded
+                if forwarded:
+                    # Use first hop, fall back on self
+                    return forwarded[0].host or self.netloc
+                return self.netloc
+
+            # 'x-forwarded-host'
+            try:
+                host: str = self.env['HTTP_X_FORWARDED_HOST']
+                return host
+            except KeyError:
+                continue
+
+        return self.netloc
 
     @property
     def subdomain(self) -> str | None:
@@ -981,36 +1067,91 @@ class Request:
             requests.
         """  # noqa: D205
         if self._cached_access_route is None:
-            # NOTE(kgriffs): Try different headers in order of
-            # preference; if none are found, fall back to REMOTE_ADDR.
-            #
-            # If one of these headers is present, but its value is
-            # malformed such that we end up with an empty list, or
-            # a non-empty list containing malformed values, go ahead
-            # and return the results as-is. The alternative would be
-            # to fall back to another header or to REMOTE_ADDR, but
-            # that only masks the problem; the operator needs to be
-            # aware that an upstream proxy is malfunctioning.
+            profile = self._trust_profile
+            if profile is None:
+                # NOTE(kgriffs): Try different headers in order of
+                # preference; if none are found, fall back to REMOTE_ADDR.
+                #
+                # If one of these headers is present, but its value is
+                # malformed such that we end up with an empty list, or
+                # a non-empty list containing malformed values, go ahead
+                # and return the results as-is. The alternative would be
+                # to fall back to another header or to REMOTE_ADDR, but
+                # that only masks the problem; the operator needs to be
+                # aware that an upstream proxy is malfunctioning.
 
-            if 'HTTP_FORWARDED' in self.env:
-                self._cached_access_route = []
+                if 'HTTP_FORWARDED' in self.env:
+                    self._cached_access_route = []
+                    for hop in self.forwarded or ():
+                        if hop.src is not None:
+                            host, __ = parse_host(hop.src)
+                            self._cached_access_route.append(host)
+                elif 'HTTP_X_FORWARDED_FOR' in self.env:
+                    addresses = self.env['HTTP_X_FORWARDED_FOR'].split(',')
+                    self._cached_access_route = [ip.strip() for ip in addresses]
+                elif 'HTTP_X_REAL_IP' in self.env:
+                    self._cached_access_route = [self.env['HTTP_X_REAL_IP']]
+
+                if self._cached_access_route:
+                    if self._cached_access_route[-1] != self.remote_addr:
+                        self._cached_access_route.append(self.remote_addr)
+                else:
+                    self._cached_access_route = [self.remote_addr]
+            else:
+                # NOTE: Profile-driven framing. The four chains are kept
+                #   independent; here only the access-route header priority
+                #   declared by the TrustProfile is consulted.
+                self._cached_access_route = self._frame_access_route(profile)
+
+        return self._cached_access_route
+
+    def _frame_access_route(self, profile: TrustProfile) -> list[str]:
+        """Build the access route according to a trust profile snapshot.
+
+        The first header listed by the profile that is present wins; a
+        malformed value is returned as parsed instead of falling through
+        to the next header.
+        """
+        route: list[str] = []
+        env = self.env
+
+        for header in profile.access_route_headers:
+            if header == 'forwarded':
+                if not profile.trust_forwarded or 'HTTP_FORWARDED' not in env:
+                    continue
+
                 for hop in self.forwarded or ():
                     if hop.src is not None:
                         host, __ = parse_host(hop.src)
-                        self._cached_access_route.append(host)
-            elif 'HTTP_X_FORWARDED_FOR' in self.env:
-                addresses = self.env['HTTP_X_FORWARDED_FOR'].split(',')
-                self._cached_access_route = [ip.strip() for ip in addresses]
-            elif 'HTTP_X_REAL_IP' in self.env:
-                self._cached_access_route = [self.env['HTTP_X_REAL_IP']]
+                        route.append(host)
+                break
 
-            if self._cached_access_route:
-                if self._cached_access_route[-1] != self.remote_addr:
-                    self._cached_access_route.append(self.remote_addr)
+            if header == 'x-forwarded-for':
+                if 'HTTP_X_FORWARDED_FOR' not in env:
+                    continue
+
+                addresses = env['HTTP_X_FORWARDED_FOR'].split(',')
+                route = [ip.strip() for ip in addresses]
+                break
+
+            # 'x-real-ip'
+            if 'HTTP_X_REAL_IP' not in env:
+                continue
+
+            route = [env['HTTP_X_REAL_IP']]
+            break
+
+        if profile.append_peer_address:
+            # NOTE: WSGI reads REMOTE_ADDR directly, so this value is not
+            #   derived from any of the trusted headers.
+            peer = self.remote_addr
+            if route:
+                if route[-1] != peer:
+                    route.append(peer)
             else:
-                self._cached_access_route = [self.remote_addr]
+                route = [peer]
 
-        return self._cached_access_route
+        return route
 
     @property
     def remote_addr(self) -> str:
@@ -3030,6 +3171,19 @@ class RequestOptions:
     By default, handlers are provided for the ``application/json``,
     ``application/x-www-form-urlencoded`` and ``multipart/form-data`` media types.
     """
+    trust_profile: TrustProfile | None
+    """Trust framing profile to apply to newly constructed Requests, or
+    ``None`` (the default) to use the built-in framing rules.
+
+    When set to a :class:`~falcon.TrustProfile`, each Request snapshots the
+    profile at construction time and fills its four independent proxy trust
+    caches (:attr:`~Request.access_route`, :attr:`~Request.forwarded`,
+    :attr:`~Request.forwarded_scheme`/:attr:`~Request.forwarded_host`, and
+    :attr:`~Request.forwarded_uri`/:attr:`~Request.forwarded_prefix`)
+    according to that snapshot. Replacing the profile here only affects
+    Requests that are constructed afterwards; existing Request instances
+    keep their own snapshot and cached values.
+    """
 
     __slots__ = (
         'keep_blank_qs_values',
@@ -3038,6 +3192,7 @@ class RequestOptions:
         'strip_url_path_trailing_slash',
         'default_media_type',
         'media_handlers',
+        'trust_profile',
     )
 
     def __init__(self) -> None:
@@ -3047,3 +3202,4 @@ class RequestOptions:
         self.strip_url_path_trailing_slash = False
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
+        self.trust_profile = None

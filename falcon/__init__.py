@@ -45,6 +45,7 @@ __all__ = (
     'RequestOptions',
     'Response',
     'ResponseOptions',
+    'TrustProfile',
     # Public constants
     'HTTP_METHODS',
     'WEBDAV_METHODS',
@@ -598,6 +599,7 @@ from falcon.status_codes import HTTP_UPGRADE_REQUIRED
 from falcon.status_codes import HTTP_USE_PROXY
 from falcon.status_codes import HTTP_VARIANT_ALSO_NEGOTIATES
 from falcon.stream import BoundedStream
+from falcon.trust import TrustProfile
 
 # NOTE(kgriffs): Ensure that "from falcon import uri" will import
 #   the same front-door module as "import falcon.uri". This works by
